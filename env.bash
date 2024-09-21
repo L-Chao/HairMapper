@@ -1,0 +1,1 @@
+export PYTHONPATH=/home/luanchao/HairMapper/encoder4editing:${PYTHONPATH}

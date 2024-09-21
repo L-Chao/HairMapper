@@ -37,7 +37,7 @@ activation_funcs = {
 _inited = False
 _plugin = None
 _null_tensor = torch.empty([0])
-USING_CUDA_TO_SPEED_UP = True
+USING_CUDA_TO_SPEED_UP = False # cuda extension is supported only on windows
 
 def _init():
     global _inited, _plugin

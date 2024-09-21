@@ -23,7 +23,7 @@ from . import conv2d_gradfix
 _inited = False
 _plugin = None
 
-USING_CUDA_TO_SPEED_UP = True
+USING_CUDA_TO_SPEED_UP = False # cuda extension is supported only on windows
 
 
 

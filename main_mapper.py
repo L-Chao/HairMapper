@@ -13,122 +13,71 @@ from PIL import ImageFile
 import os
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+from encoder4editing.encode import ImageEncoder
 
-def parse_args():
-    """Parses arguments."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='./test_data',
-                        help='Directory of test data.')
-    parser.add_argument('--learning_rate', type=float, default=0.01,
-                        help='Learning rate for optimization.')
-    parser.add_argument('--num_iterations', type=int, default=100,
-                        help='Number of optimization iterations.')
+class HairMapper(object):
+    def __init__(self,
+                 mapper_model: str,
+                 parsing_net_model: str) -> None:
+        model_name = 'stylegan2_ada'
+        latent_space_type = 'wp'
+        truncation_psi = 0.75
 
-    parser.add_argument('--loss_weight_feat', type=float, default=3e-5,
-                        help='The perceptual loss weight.')
-    parser.add_argument('--loss_weight_id', type=float, default=1.0,
-                        help='The facial identity loss weight')
-    parser.add_argument("--remain_ear",
-                        help="if set, remain ears in the original image",
-                        action="store_true")
-    parser.add_argument("--diffuse",
-                        help="if set, perform an additional diffusion method",
-                        action="store_true")
-
-    parser.add_argument('--dilate_kernel_size', type=int, default=50,
-                        help='dilate kernel size')
-
-    parser.add_argument('--blur_kernel_size', type=int, default=30,
-                        help='blur kernel size')
-
-    parser.add_argument('--truncation_psi', type=float, default='0.75')
-    return parser.parse_args()
+        print(f'Initializing generator.')
+        model = StyleGAN2adaGenerator(model_name, logger=None, truncation_psi=truncation_psi)
 
 
-def mkdir(path):
-    if not os.path.exists(path):
-        os.mkdir(path)
+        mapper = LevelMapper(input_dim=512).eval().cuda()
+        ckpt = torch.load(mapper_model)
+        alpha = float(ckpt['alpha']) * 1.2
+        mapper.load_state_dict(ckpt['state_dict'], strict=True)
+        kwargs = {'latent_space_type': latent_space_type}
+        parsing_net = get_parsingNet(save_pth=parsing_net_model)
 
+        inverter = InverterRemoveHair(
+            model_name,
+            Generator=model,
+            learning_rate=0.01,
+            reconstruction_loss_weight=1.0,
+            perceptual_loss_weight=5e-5,
+            truncation_psi=truncation_psi,
+            logger=None)
 
-def run():
-    args = parse_args()
-    model_name = 'stylegan2_ada'
-    latent_space_type = 'wp'
-
-    print(f'Initializing generator.')
-    model = StyleGAN2adaGenerator(model_name, logger=None, truncation_psi=args.truncation_psi)
-
-    mapper = LevelMapper(input_dim=512).eval().cuda()
-    ckpt = torch.load('./mapper/checkpoints/final/best_model.pt')
-    alpha = float(ckpt['alpha']) * 1.2
-    mapper.load_state_dict(ckpt['state_dict'], strict=True)
-    kwargs = {'latent_space_type': latent_space_type}
-    parsingNet = get_parsingNet(save_pth='./ckpts/face_parsing.pth')
-    inverter = InverterRemoveHair(
-        model_name,
-        Generator=model,
-        learning_rate=0.01,
-        reconstruction_loss_weight=1.0,
-        perceptual_loss_weight=5e-5,
-        truncation_psi=args.truncation_psi,
-        logger=None)
-
-    code_dir = os.path.join(args.data_dir, 'code')
-    origin_img_dir = os.path.join(args.data_dir, 'origin')
-    res_dir = os.path.join(args.data_dir, 'mapper_res')
-
-    mkdir(res_dir)
-
-    code_list = glob.glob(os.path.join(code_dir, '*.npy'))
-
-    total_num = len(code_list)
-
-    print(f'Editing {total_num} samples.')
-    pbar = tqdm(total=total_num)
-    for index in range(total_num):
-        pbar.update(1)
-        code_path = code_list[index]
-        name = os.path.basename(code_path)[:-4]
-        f_path_png = os.path.join(origin_img_dir, f'{name}.png')
-        f_path_jpg = os.path.join(origin_img_dir, f'{name}.jpg')
-        if os.path.exists(os.path.join(res_dir, f'{name}.png')):
-            continue
-        if os.path.exists(f_path_png):
-            origin_img_path = f_path_png
-        elif os.path.exists(f_path_jpg):
-            origin_img_path = f_path_jpg
-        else:
-            continue
-
-        latent_codes_origin = np.reshape(np.load(code_path), (1, 18, 512))
-
+        self.alpha = alpha
+        self.kwargs = kwargs
+        self.parsing_net = parsing_net
+        self.inverter = inverter
+        self.model = model
+        self.dilate_kernel_size = 50
+        self.blur_kernel_size = 50
+        self.mapper = mapper
+    
+    def inference(self,
+                  latent_codes_origin: np.ndarray,
+                  use_defuse: bool,
+                  origin_img_path: str,
+                  res_save_path: str) -> None:
         mapper_input = latent_codes_origin.copy()
         mapper_input_tensor = torch.from_numpy(mapper_input).cuda().float()
         edited_latent_codes = latent_codes_origin
-        edited_latent_codes[:, :8, :] += alpha * mapper(mapper_input_tensor).to('cpu').detach().numpy()
+        edited_latent_codes[:, :8, :] += self.alpha * self.mapper(mapper_input_tensor).to('cpu').detach().numpy()
 
         origin_img = cv2.imread(origin_img_path)
 
-        outputs = model.easy_style_mixing(latent_codes=edited_latent_codes,
+        outputs = self.model.easy_style_mixing(latent_codes=edited_latent_codes,
                                           style_range=range(7, 18),
                                           style_codes=latent_codes_origin,
                                           mix_ratio=0.8,
-                                          **kwargs
+                                          **self.kwargs
                                           )
-
         edited_img = outputs['image'][0][:, :, ::-1]
 
-        # --remain_ear: preserve the ears in the original input image.
-        if args.remain_ear:
-            hair_mask = get_hair_mask(img_path=origin_img, net=parsingNet, include_hat=True, include_ear=False)
-        else:
-            hair_mask = get_hair_mask(img_path=origin_img, net=parsingNet, include_hat=True, include_ear=True)
-
+        hair_mask = get_hair_mask(img_path=origin_img, net=self.parsing_net, include_hat=True, include_ear=False)
         mask_dilate = cv2.dilate(hair_mask,
-                                 kernel=np.ones((args.dilate_kernel_size, args.dilate_kernel_size), np.uint8))
-        mask_dilate_blur = cv2.blur(mask_dilate, ksize=(args.blur_kernel_size, args.blur_kernel_size))
+                                 kernel=np.ones((self.dilate_kernel_size, self.dilate_kernel_size), np.uint8))
+        mask_dilate_blur = cv2.blur(mask_dilate, ksize=(self.blur_kernel_size, self.blur_kernel_size))
         mask_dilate_blur = (hair_mask + (255 - hair_mask) / 255 * mask_dilate_blur).astype(np.uint8)
-
+        
         face_mask = 255 - mask_dilate_blur
 
         index = np.where(face_mask > 0)
@@ -136,13 +85,11 @@ def run():
         cx = (np.min(index[1]) + np.max(index[1])) // 2
         center = (cx, cy)
 
-        res_save_path = os.path.join(res_dir, f'{name}.png')
-
-        if args.diffuse:
+        if use_defuse:
             synthesis_image = origin_img * (1 - hair_mask // 255) + edited_img * (hair_mask // 255)
 
             target_image = (synthesis_image[:, :, ::-1]).astype(np.uint8)
-            res_wp, _, res_img = inverter.easy_mask_diffuse(target=target_image,
+            res_wp, _, res_img = self.inverter.easy_mask_diffuse(target=target_image,
                                                             init_code=edited_latent_codes,
                                                             mask=hair_mask, iteration=150)
 
@@ -156,4 +103,16 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    # run()
+    encode_model_path = '/home/luanchao/HairMapper/ckpts/e4e_ffhq_encode.pt'
+    image_encoder = ImageEncoder(encode_model_path)
+    
+    mapper_model = './mapper/checkpoints/final/best_model.pt'
+    parsing_net_model = './ckpts/face_parsing.pth'
+    hair_mapper =  HairMapper(mapper_model, parsing_net_model)
+
+    image_path = './test_data/origin/jb.jpg'
+    output_path = './test_data/origin/mapper_jb.jpg'
+    code = image_encoder.inference(image_path)
+    hair_mapper.inference(code, False, image_path, output_path)
+    # np.save('code.npy', code)
